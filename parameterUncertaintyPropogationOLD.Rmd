@@ -1,0 +1,181 @@
+---
+title: "Parameter Uncertainty Propagation"
+author: "Libby Mohr"
+date: "12/3/2020"
+output: html_document
+---
+
+Calculate isotopic enrichment associated with 10% increase in nitrate concentration.
+```{r}
+AFtoDelta <- function (AF, Rst) {
+  R<- AF/(1-AF)
+  delta<- (R/Rst-1)*1000
+  delta
+}
+
+RstN <- 0.003678
+AFadd <- 0.984
+AFinit <- RstN/(1+RstN)
+maxPercentCIncrease <- 0.1
+maxAF <- (AFinit + maxPercentCIncrease*AFadd)/(1+maxPercentCIncrease)
+maxDel <- AFtoDelta(maxAF, RstN)
+```
+
+Import Linx II data, calculate depth-normalized k values for assimilatory uptake and denitrification, and regress log-transformed rate constants against log-transformed nitrate concentrations.
+```{r}
+library(readxl)
+library(tidyverse)
+
+linx <- read_xlsx(path = "./LINXII.xlsx", 
+                  sheet = "Data",
+                  col_types = c(rep("text", times = 3), 
+                                rep("numeric", times = 10)),
+                  na = "NA")
+
+racewayDepth <- 0.15 # meters
+linx <- linx %>% 
+  filter(!NO3 == 0) %>%
+  mutate(ktot_norm = ktot * Velocity * Depth/racewayDepth,
+         kden_norm = kden * Velocity * Depth/racewayDepth) %>% 
+  mutate(ku_norm = ktot_norm - kden_norm) %>%
+  mutate(ku_norm_log = log(ku_norm),
+         kden_norm_log = log(kden_norm),
+         ktot_norm_log = log(ktot_norm),
+         NO3_log = log(NO3)) 
+
+```
+
+```{r}
+library(rjags)
+library(coda)
+library(eivtools)
+# Make data into a list that can be passed to JAGS
+data <- list(x = linx$NO3_log, y = matrix(c(linx$ktot_norm_log, y2 = linx$kden_norm_log), nrow = nrow(linx)), n = nrow(linx))
+## specify priors
+data$b0 <- as.vector(c(0,0))      ## regression beta means
+data$Vb <- solve(diag(10000,2))   ## regression beta precisions
+tmp <- get_bugs_wishart_scalemat(target = c(100,100))
+data$S <- tmp$bugs.scalemat
+data$df <- tmp$bugs.df
+
+multivariate_regression <- "
+model{
+
+  betakTot ~ dmnorm(b0,Vb)      ## multivariate Normal prior on vector of regression params
+  betakDen ~ dmnorm(b0,Vb)      ## multivariate Normal prior on vector of regression params
+  precMat ~ dwish(S,df)    ## prior precision
+
+  for(i in 1:n){
+      mu[i, 1:2] <- c(betakTot[1] + betakTot[2]*x[i], betakDen[1] + betakDen[2]*x[i])
+      y[i, 1:2]  ~ dmnorm(mu[i, 1:2],precMat)             ## data model
+  }
+}"
+
+nchain = 3
+inits <- list()
+for(i in 1:nchain){
+ inits[[i]] <- list(betakTot = rnorm(2,0,5), betakDen = rnorm(2,0,5), precMat = diag(runif(2, 1/100,1/20), 2))
+}
+
+j.model   <- jags.model(file = textConnection(multivariate_regression),
+                        data = data,
+                        inits = inits,
+                        n.chains = nchain)
+var.out   <- coda.samples (model = j.model,
+                           variable.names = c("beta","prec"),
+                           n.iter = 5000)
+plot(var.out)
+gelman.diag(var.out)
+GBR <- gelman.plot(var.out)
+
+burnin = 500                                ## determine convergence
+jags.burn <- window(var.out,start=burnin)  ## remove burn-in
+plot(jags.burn)   
+outkTot <- as.matrix(jags.burn)
+```
+
+```{r}
+library(rjags)
+library(coda)
+# Make data into a list that can be passed to JAGS
+data <- list(x = linx$NO3_log, y = linx$kden_norm_log, n = nrow(linx))
+## specify priors
+data$b0 <- as.vector(c(0,0))      ## regression beta means
+data$Vb <- solve(diag(10000,2))   ## regression beta precisions
+data$s1 <- 0.1                    ## error prior n/2
+data$s2 <- 0.1      
+
+univariate_regression <- "
+model{
+
+  beta ~ dmnorm(b0,Vb)      ## multivariate Normal prior on vector of regression params
+  prec ~ dgamma(s1,s2)    ## prior precision
+
+  for(i in 1:n){
+      mu[i] <- beta[1] + beta[2]*x[i]       ## process model
+      y[i]  ~ dnorm(mu[i],prec)             ## data model
+  }
+}"
+
+nchain = 3
+inits <- list()
+for(i in 1:nchain){
+ inits[[i]] <- list(beta = rnorm(2,0,5), prec = runif(1,1/100,1/20))
+}
+
+j.model   <- jags.model(file = textConnection(univariate_regression),
+                        data = data,
+                        inits = inits,
+                        n.chains = nchain)
+var.out   <- coda.samples (model = j.model,
+                           variable.names = c("beta","prec"),
+                           n.iter = 5000)
+plot(var.out)
+gelman.diag(var.out)
+GBR <- gelman.plot(var.out)
+
+burnin = 500                                ## determine convergence
+jags.burn <- window(var.out,start=burnin)  ## remove burn-in
+plot(jags.burn)   
+outkDen <- as.matrix(jags.burn)
+```
+
+Define a model that calculates time series of 15N-N2 given a matrix of parameters, where each parameter if a column and each row represents a realization.
+```{r}
+predictN <- function(N15NO30, NO30, N20, B0Tot, B1Tot, precTot, B0Den, B1Den, precDen, k2, n, time = seq(0, 60*24, length.out = 50)){
+  kTotMu <- B0Tot + B1Tot * log(NO30) 
+  kTot <- rlnorm(n = length(kTotMu), meanlog = kTotMu, sdlog = sqrt(1/precTot))
+  kDenMu <- B0Den + B1Den * log(NO30) 
+  kDen <- rlnorm(n = length(kDenMu), meanlog = kDenMu, sdlog = sqrt(1/precDen))
+  kAssim <- kTot-kDen
+ # Note: consider modeling covariance between ku and kden
+  N <- matrix(NA,n,length(time))
+  for(i in 1:length(time)){
+    N15 <- (kDen*N15NO30/(k2 - kDen - kAssim))*(exp(-(kDen + kAssim)*time[i])- exp(-k2*time[i])) + N20*AFinit
+    NTot <- (kDen*NO30/(k2 - kDen - kAssim))*(exp(-(kDen + kAssim)*time[i])- exp(-k2*time[i])) + N20
+    N[,i] <- AFtoDelta(N15/NTot, RstN)                            
+  }
+  return(N)
+}
+
+n <- 10
+simTime <- seq(0, 60*48, length.out = 500)
+N2_diss_amb <- (0.78*101325*(1-2.25577e-5*1460)^(5.25588))/(155e6)
+test <- predictN(N15NO30 = 10, 
+                 NO30 = 100, 
+                 N20 = N2_diss_amb, 
+                 B0Tot = outkTot[1:n,"beta[1]"], 
+                 B1Tot = outkTot[1:n,"beta[2]"], 
+                 precTot = outkTot[1:n,"prec"], 
+                 B0Den = outkDen[1:n, "beta[1]"],
+                 B1Den = outkDen[1:n,"beta[2]"], 
+                 precDen = outkDen[1:n,"prec"], 
+                 k2 = 0.09, 
+                 n = n, 
+                 time = simTime)
+testDF<- data.frame(t(test))%>%
+  mutate(time = simTime) %>%
+  pivot_longer(cols = 1:n)
+ggplot(data = testDF, aes(x = time, y = value, color = name)) +
+  geom_line()
+```
