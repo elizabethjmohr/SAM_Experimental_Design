@@ -102,65 +102,27 @@ out <- as.matrix(jags.burn)
 
 ```
 
-Test Monte Carlo code for a single delta value, NO3 concentration, and gas exchange rate constant.
-```{r}
-# Specify number of realizations, n
-n <- 10
-# Define indices to sample MCMC output
-indices <- sample.int(nrow(out), n, replace = TRUE)
-# Specify simulation time
-simTime <- seq(0, 60*24, length.out = 500)
-
-# Generate ensemble of predictions for delta N15-NGas vs. time
-ensemble <- predictNGas(N15NO30 = 0.5, 
-                        NO30 = 10,
-                        deltaNO30 = AFtoDelta((AFinit + (1/20)*AFadd)/(1+(1/20)), RstN),
-                        B0Tot = out[indices,"betakTot[1]"], 
-                        B1Tot = out[indices,"betakTot[2]"], 
-                        precTot = out[indices,"preckTot"], 
-                        B0Den = out[indices, "betakDen[1]"],
-                        B1Den = out[indices,"betakDen[2]"], 
-                        precDen = out[indices,"preckDen"], 
-                        k2 = 0.02, 
-                        n = n, 
-                        time = simTime)
-
-# Calculate 95% prediction interval limits at each time
-pi <- getPI(ensemble, simTime)
-# Create data frame of delta values for plotting
-delta <- data.frame(t(ensemble$delta))%>%
-  mutate(time = simTime/60) %>%
-  pivot_longer(cols = 1:n)
-# Plot each of 10 realizations
-ggplot(delta, aes(x = time, y = value, color = name)) + 
-  geom_line()
-# Plot prediction interval with median
-ggplot(data = pi, aes(x = time)) +
-  geom_ribbon(aes(x = time, ymin = Lower, ymax = Upper), fill = "grey80") + 
-  geom_line(aes(y = Median)) +
-  xlab("Time (hours)") +
-  ylab("Delta 15N-NGas")+
-  theme_minimal()
-```
-
 Run Monte Carlo for 3 initial nitrate concentrations, 3 nitrate enrichments, and 3 gas exchange constants. 
 ```{r}
 # Specify number of realizations, n
-n <- 1000
+n <- 5000
 # Define indices to sample MCMC output
 indices <- sample.int(nrow(out), n, replace = TRUE)
 # Specify simulation time
 simTime <- seq(0, 60*24, length.out = 500)
 
 # Generate data frame of parameter combinations
-NO30 <- c(10, 100, 200)
+NO3Pre <- c(10, 100, 200)
 deltaNO30 <- c(5000, 10000, 20000)
-N15NO30 <-  matrix(calcPercN15(deltaNO30),nrow = 3) %*% matrix(NO30, nrow = 1) # Columns are delta values, rows are NO3 concentrations
+NO3add <- matrix(calcPercN15(deltaNO30),nrow = 3) %*% matrix(NO3Pre, nrow = 1) # Columns are concentrations, rows are delta values
+NO30 <- (1+matrix(calcPercN15(deltaNO30),nrow = 3)) %*% matrix(NO3Pre, nrow = 1)
+N15NO30 <- 0.984 * NO3add + 0.003664522 * matrix(rep(NO3Pre, each = length(deltaNO30)), nrow = length(deltaNO30))
 k2 <- c(0.01, 0.1, 1)
 params <- data.frame(
   N15NO30 = rep(as.vector(N15NO30), times = length(k2)),
-  NO30 = rep(rep(NO30, each = length(deltaNO30)), times = length(k2)), 
-  deltaNO30 = rep(rep(deltaNO30, times = length(NO30)), times = length(k2)), 
+  NO30 = rep(as.vector(NO30), times = length(k2)), 
+  NO3Pre = rep(rep(NO3Pre, each = length(deltaNO30) ), times = length(k2)),
+  deltaNO30 = rep(rep(deltaNO30, times = length(NO3Pre)), times = length(k2)), 
   k2 = rep(k2, each = (length(as.vector(N15NO30))))
 )
 
@@ -177,23 +139,35 @@ ensembles <- pmap(params,
                   time = simTime)
 
 # Calculate median, 2.5% and 97.5% quantiles for each time
-PI0.01 <- map_dfr(ensembles[which(params$k2 == 0.01)], getPI, time = simTime)
-PI0.1 <- map_dfr(ensembles[which(params$k2 == 0.1)], getPI, time = simTime)
-PI1 <- map_dfr(ensembles[which(params$k2 == 1)], getPI, time = simTime)
+deltaN15GasPIs <- map_dfr(ensembles, getPI, time = simTime, varName = "deltaN15NGas")
+deltaN15NO3PIs <- map_dfr(ensembles, getPI, time = simTime, varName = "deltaN15NO3")
 
 # Plot prediction intervals with median
-p0.01 <- plotPI(PI0.01) + ggtitle(expression(paste("k2 = 0.01 min"^"-1")))
-p0.1 <- plotPI(PI0.1) + ggtitle(expression(paste("k2 = 0.1 min"^"-1")))
-p1 <- plotPI(PI1) + ggtitle(expression(paste("k2 = 1 min"^"-1")))
+library(ggtext)
+k2Labs <- paste("k<sub>2</sub> = ", k2, "min<sup>-1</sup>")
+names(k2Labs) <- k2
+NO3PreLabs <- paste("[NO<sub>3</sub>]<sub>bg</sub> = ", NO3Pre, "&mu;g L<sup>-1</sup>")
+names(NO3PreLabs) <- NO3Pre
 
-plotPI(PI0.01) + ggtitle(expression(paste("k2 = 0.01 min"^"-1")))
-plotPI(PI0.1) + ggtitle(expression(paste("k2 = 0.1 min"^"-1")))
-plotPI(PI1) + ggtitle(expression(paste("k2 = 1 min"^"-1")))
+# Nitrate isotopic composition plot
+plotPI(deltaN15NO3PIs %>% filter(delta == 10000)) + 
+  facet_wrap(vars(NO3Pre), nrow = 1, labeller = labeller(NO3Pre = NO3PreLabs) ) + 
+  ylab(expression(paste(delta ^15*N-NO[3], " (\u2030)")))  + 
+  ggtitle("(&delta;<sup>15</sup>N-NO<sub>3</sub>)<sub>init</sub> = 10,000&permil;") +
+  theme(
+    strip.text = element_markdown(), 
+    plot.title = element_markdown()
+  )
 
-# Save plots
-ggsave("plots/k0.01.png", plot = p0.01, device = png())
-ggsave("plots/k0.1.png", plot = p0.1, device = png())
-ggsave("plots/k1.png", plot = p1, device = png())
-
-
+# N-gas isotopic composition plot
+plotPI(deltaN15GasPIs %>% filter(delta == 10000)) + 
+  facet_grid(rows = vars(NO3Pre), cols = vars(k2), labeller = labeller(k2 = k2Labs, NO3Pre = NO3PreLabs)) + 
+  ylab(expression(paste(delta ^15*N-N[gas], " (\u2030)"))) +
+  ggtitle("(&delta;<sup>15</sup>N-NO<sub>3</sub>)<sub>init</sub> = 10,000&permil;") +
+  theme(
+    strip.text = element_markdown(), 
+    strip.text.x = element_markdown(),
+    strip.text.y = element_markdown(),
+    plot.title = element_markdown()
+  )
 ```

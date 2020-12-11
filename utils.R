@@ -4,6 +4,11 @@ AFtoDelta <- function (AF, Rst) {
   delta
 }
 
+RtoDelta <- function (R, Rst) {
+  delta<- (R/Rst-1)*1000
+  delta
+}
+
 calcPercN15<- function(deltaTarg){
   RstN <- 0.003678
   AFadd <- 0.984
@@ -14,40 +19,47 @@ calcPercN15<- function(deltaTarg){
 }
 
 # Assumptions: Dissolved N2 gas concentration at steady state before tracer experiment
-predictNGas <- function(N15NO30, NO30, deltaNO30, B0Tot, B1Tot, precTot, B0Den, B1Den, precDen, k2, n, time = seq(0, 60*24, length.out = 50)){
+predictNGas <- function(N15NO30, NO30, NO3Pre, deltaNO30, B0Tot, B1Tot, precTot, B0Den, B1Den, precDen, k2, n, time = seq(0, 60*24, length.out = 50)){
   kTotMu <- B0Tot + B1Tot * log(NO30) 
   kTot <- rlnorm(n = length(kTotMu), meanlog = kTotMu, sdlog = sqrt(1/precTot))
   kDenMu <- B0Den + B1Den * log(kTot) 
   kDen <- rlnorm(n = length(kDenMu), meanlog = kDenMu, sdlog = sqrt(1/precDen))
   kAssim <- kTot-kDen
-  delta <- matrix(NA,n,length(time))
-  NGas <- matrix(NA,n,length(time))
+  N15Nitrate <- matrix(NA,n,length(time))
+  N15NitrateFrac <- matrix(NA,n,length(time))
+  NitrateTotal <- matrix(NA,n,length(time))
+  N15Gas <- matrix(NA,n,length(time))
+  NGasTotal <- matrix(NA,n,length(time))
+  deltaN15NO3 <- matrix(NA,n,length(time))
+  deltaN15NGas <- matrix(NA,n,length(time))
+  AFPre <- 0.003664522
   for(i in 1:length(time)){
-    N15 <- (kDen*N15NO30/(k2 - kDen - kAssim))*(exp(-(kDen + kAssim)*time[i])- exp(-k2*time[i])) + AFinit * kDen*NO30/k2
-    NTot <- (kDen*NO30/(k2 - kDen - kAssim))*(exp(-(kDen + kAssim)*time[i])- exp(-k2*time[i])) + kDen*NO30/k2
-    delta[,i] <- AFtoDelta(N15/NTot, 0.003678)
-    NGas[,i] <- NTot
+    N15Nitrate[,i] <- NO3Pre * (AFPre) + (N15NO30-AFPre*NO3Pre)*exp(-(kAssim + kDen) * time[i])
+    N15NitrateFrac[,i] <- NO3Pre * (AFPre)/N15NO30 + (1-AFPre*NO3Pre/N15NO30)*exp(-(kAssim + kDen) * time[i])
+    NitrateTotal[,i] <- NO3Pre + (NO30-NO3Pre)* exp(-(kAssim + kDen) * time[i])
+    N15Gas[,i] <- AFPre*NO3Pre*kDen/k2+(N15NO30-AFPre*NO3Pre) * (kDen/(k2 - kDen - kAssim))*(exp(-(kDen + kAssim)*time[i])- exp(-k2*time[i])) 
+    NGasTotal[,i] <- NO3Pre*kDen/k2 + (NO30-NO3Pre)*(kDen/(k2 - kDen - kAssim))*(exp(-(kDen + kAssim)*time[i])- exp(-k2*time[i])) 
+    deltaN15NO3[,i] <- AFtoDelta(N15Nitrate[,i]/NitrateTotal[,i], 0.003678)
+    deltaN15NGas[,i] <-  AFtoDelta(N15Gas[,i]/NGasTotal[,i], 0.003678)
   }
-  return(list(delta = delta, NGas = NGas, kTot = kTot, kDen = kDen, kAssim = kAssim, deltaNO30 = deltaNO30, NO30 = NO30))
+  return(list(N15Nitrate = N15Nitrate, deltaN15NO3 = deltaN15NO3, N15Gas = N15Gas, deltaN15NGas = deltaN15NGas, kTot = kTot, kDen = kDen, kAssim = kAssim, k2 = k2, deltaNO30 = deltaNO30, NO30 = NO30, NO3Pre = NO3Pre))
 }
 
-getPI <- function(ensemble, time){
-  pi <- apply(ensemble$delta,2,quantile,c(0.025,0.5,0.975)) %>%
+getPI <- function(ensemble, varName, time){
+  pi <- apply(ensemble[[varName]],2,quantile,probs = c(0.025,0.5,0.975), na.rm = TRUE) %>%
     t() %>%
     as_tibble() %>%
     mutate(time = time/60) %>%
     rename("Lower" = "2.5%", "Median" = "50%", "Upper" = "97.5%") %>% 
-    mutate(delta = ensemble$deltaNO30, NO30 = ensemble$NO30)
+    mutate(delta = ensemble$deltaNO30, NO3Pre = ensemble$NO3Pre, k2 = ensemble$k2)
   return(pi)
 }
 
-plotPI <- function(PI){
+plotPI <- function(PI, xFacet = "NO3Pre", yFacet = "delta"){
   plot <- ggplot(data = PI, aes(x = time)) +
     geom_ribbon(aes(x = time, ymin = Lower, ymax = Upper), fill = "grey80") + 
     geom_line(aes(y = Median)) +
-    facet_grid(rows = vars(NO30), cols = vars(delta), labeller = labeller(.rows = label_both, .cols = label_both)) +
     xlab("Time (hours)") +
-    ylab("Delta 15N-NGas")+
     theme_minimal()
   return(plot)
 }
